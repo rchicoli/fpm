@@ -128,37 +128,25 @@ class FPM::Package::Deb < FPM::Package
     "Do not add all files in /etc as configuration files by default for Debian packages.",
     :default => false
 
-  option "--auto-config-files", :flag,
-    "Init script and default configuration files will be labeled as " \
-    "configuration files for Debian packages.",
-    :default => true
-
   option "--shlibs", "SHLIBS", "Include control/shlibs content. This flag " \
     "expects a string that is used as the contents of the shlibs file. " \
     "See the following url for a description of this file and its format: " \
     "http://www.debian.org/doc/debian-policy/ch-sharedlibs.html#s-shlibs"
 
   option "--init", "FILEPATH", "Add FILEPATH as an init script",
-    :multivalued => true do |file|
+	:multivalued => true do |file|
     next File.expand_path(file)
   end
 
   option "--default", "FILEPATH", "Add FILEPATH as /etc/default configuration",
-    :multivalued => true do |file|
+	:multivalued => true do |file|
     next File.expand_path(file)
   end
 
   option "--upstart", "FILEPATH", "Add FILEPATH as an upstart script",
-    :multivalued => true do |file|
-    next File.expand_path(file)
-  end
-  
-  option "--systemd", "FILEPATH", "Add FILEPATH as a systemd script",
 	:multivalued => true do |file|
     next File.expand_path(file)
   end
-  
-  option "--systemd-restart-after-upgrade", :flag , "Restart service after upgrade", :default => true
 
   def initialize(*args)
     super(*args)
@@ -236,7 +224,7 @@ class FPM::Package::Deb < FPM::Package
   end # def input
 
   def extract_info(package)
-    build_path("control").tap do |path|
+    with(build_path("control")) do |path|
       FileUtils.mkdir(path) if !File.directory?(path)
       # Unpack the control tarball
       safesystem("ar p #{package} control.tar.gz | tar -zxf - -C #{path}")
@@ -268,7 +256,7 @@ class FPM::Package::Deb < FPM::Package
       self.name = parse.call("Package")
       self.url = parse.call("Homepage")
       self.vendor = parse.call("Vendor") || self.vendor
-      parse.call("Provides").tap do |provides_str|
+      with(parse.call("Provides")) do |provides_str|
         next if provides_str.nil?
         self.provides = provides_str.split(/\s*,\s*/)
       end
@@ -383,26 +371,14 @@ class FPM::Package::Deb < FPM::Package
       end
     end
 
-    attributes.fetch(:deb_systemd_list, []).each do |systemd|
-      name = File.basename(systemd, ".service")
-      dest_systemd = staging_path("lib/systemd/system/#{name}.service")
-      FileUtils.mkdir_p(File.dirname(dest_systemd))
-      FileUtils.cp(systemd, dest_systemd)
-      File.chmod(0644, dest_systemd)
-
-      # set the attribute with the systemd service name
-      attributes[:deb_systemd] = name
-    end
-
-    if script?(:before_upgrade) or script?(:after_upgrade) or attributes[:deb_systemd]
-      puts "Adding action files"
-      if script?(:before_install) or script?(:before_upgrade) 
+    if script?(:before_upgrade) or script?(:after_upgrade)
+      if script?(:before_install) or script?(:before_upgrade)
         scripts[:before_install] = template("deb/preinst_upgrade.sh.erb").result(binding)
       end
-      if script?(:before_remove) or attributes[:deb_systemd]
+      if script?(:before_remove)
         scripts[:before_remove] = template("deb/prerm_upgrade.sh.erb").result(binding)
       end
-      if script?(:after_install) or script?(:after_upgrade) or attributes[:deb_systemd]
+      if script?(:after_install) or script?(:after_upgrade)
         scripts[:after_install] = template("deb/postinst_upgrade.sh.erb").result(binding)
       end
       if script?(:after_remove)
@@ -471,35 +447,9 @@ class FPM::Package::Deb < FPM::Package
       File.chmod(0644, dest_upstart)
 
       # Install an init.d shim that calls upstart
-      dest_init = staging_path("etc/init.d/#{name}")
+      dest_init = staging_path("/etc/init.d/#{name}")
       FileUtils.mkdir_p(File.dirname(dest_init))
       FileUtils.ln_s("/lib/init/upstart-job", dest_init)
-    end
-
-    attributes.fetch(:deb_systemd_list, []).each do |systemd|
-      name = File.basename(systemd, ".service")
-      dest_systemd = staging_path("lib/systemd/system/#{name}.service")
-      FileUtils.mkdir_p(File.dirname(dest_systemd))
-      FileUtils.cp(systemd, dest_systemd)
-      File.chmod(0644, dest_systemd)
-    end
-
-    write_control_tarball
-
-    # Tar up the staging_path into data.tar.{compression type}
-    case self.attributes[:deb_compression]
-      when "gz", nil
-        datatar = build_path("data.tar.gz")
-        compression = "-z"
-      when "bzip2"
-        datatar = build_path("data.tar.bz2")
-        compression = "-j"
-      when "xz"
-        datatar = build_path("data.tar.xz")
-        compression = "-J"
-      else
-        raise FPM::InvalidPackageConfiguration,
-          "Unknown compression type '#{self.attributes[:deb_compression]}'"
     end
 
     args = [ tar_cmd, "-C", staging_path, compression ] + data_tar_flags + [ "-cf", datatar, "." ]
@@ -507,7 +457,7 @@ class FPM::Package::Deb < FPM::Package
 
     # pack up the .deb, which is just an 'ar' archive with 3 files
     # the 'debian-binary' file has to be first
-    File.expand_path(output_path).tap do |output_path|
+    with(File.expand_path(output_path)) do |output_path|
       ::Dir.chdir(build_path) do
         safesystem("ar", "-qc", output_path, "debian-binary", "control.tar.gz", datatar)
       end
@@ -520,6 +470,12 @@ class FPM::Package::Deb < FPM::Package
     end.flatten
     self.provides = self.provides.collect do |provides|
       fix_provides(provides)
+    end.flatten
+    self.replaces = self.replaces.collect do |replaces|
+      fix_replaces(replaces)
+    end.flatten
+    self.conflicts = self.conflicts.collect do |conflicts|
+      fix_conflicts(conflicts)
     end.flatten
 
     if origin == FPM::Package::Deb
@@ -566,9 +522,9 @@ class FPM::Package::Deb < FPM::Package
     end
 
     if dep.include?("_")
-      logger.warn("Replacing dependency underscores with dashes in '#{dep}' because " \
+      logger.warn("Replacing dependency underscores with whitespaces in '#{dep}' because " \
                    "debs don't like underscores")
-      dep = dep.gsub("_", "-")
+      dep = dep.gsub("_", " ")
     end
 
     # Convert gem ~> X.Y.Z to '>= X.Y.Z' and << X.Y+1.0
@@ -614,11 +570,45 @@ class FPM::Package::Deb < FPM::Package
     end
 
     if provides.include?("_")
-      logger.warn("Replacing 'provides' underscores with dashes in '#{provides}' because " \
+      logger.warn("Replacing 'provides' underscores with whitespaces in '#{provides}' because " \
                    "debs don't like underscores")
-      provides = provides.gsub("_", "-")
+      provides = provides.gsub("_", " ")
     end
     return provides.rstrip
+  end
+
+  def fix_replaces(replaces)
+    name_re = /^[^ \(]+/
+    name = replaces[name_re]
+    if name =~ /[A-Z]/
+      logger.warn("Downcasing replaces '#{name}' because deb packages " \
+                   " don't work so good with uppercase names")
+      replaces = replaces.gsub(name_re) { |n| n.downcase }
+    end
+
+    if replaces.include?("_")
+      logger.warn("Replacing 'replaces' underscores with whitespaces in '#{replaces}' because " \
+                   "debs don't like underscores")
+      replaces = replaces.gsub("_", " ")
+    end
+    return replaces.rstrip
+  end
+
+  def fix_conflicts(conflicts)
+    name_re = /^[^ \(]+/
+    name = conflicts[name_re]
+    if name =~ /[A-Z]/
+      logger.warn("Downcasing conflicts '#{name}' because deb packages " \
+                   " don't work so good with uppercase names")
+      conflicts = conflicts.gsub(name_re) { |n| n.downcase }
+    end
+
+    if conflicts.include?("_")
+      logger.warn("Replacing 'conflicts' underscores with whitespaces in '#{conflicts}' because " \
+                   "debs don't like underscores")
+      conflicts = conflicts.gsub("_", " ")
+    end
+    return conflicts.rstrip
   end
 
   def control_path(path=nil)
@@ -644,7 +634,7 @@ class FPM::Package::Deb < FPM::Package
     write_md5sums # write the md5sums file
 
     # Make the control.tar.gz
-    build_path("control.tar.gz").tap do |controltar|
+    with(build_path("control.tar.gz")) do |controltar|
       logger.info("Creating", :path => controltar, :from => control_path)
 
       args = [ tar_cmd, "-C", control_path, "-zcf", controltar,
@@ -677,7 +667,7 @@ class FPM::Package::Deb < FPM::Package
     end
 
     # Write the control file
-    control_path("control").tap do |control|
+    with(control_path("control")) do |control|
       if attributes[:deb_custom_control]
         logger.debug("Using '#{attributes[:deb_custom_control]}' template for the control file")
         control_data = File.read(attributes[:deb_custom_control])
@@ -701,7 +691,7 @@ class FPM::Package::Deb < FPM::Package
     SCRIPT_MAP.each do |scriptname, filename|
       next unless script?(scriptname)
 
-      control_path(filename).tap do |controlscript|
+      with(control_path(filename)) do |controlscript|
         logger.debug("Writing control script", :source => filename, :target => controlscript)
         File.write(controlscript, script(scriptname))
         # deb maintainer scripts are required to be executable
@@ -711,12 +701,6 @@ class FPM::Package::Deb < FPM::Package
   end # def write_scripts
 
   def write_conffiles
-    # check for any init scripts or default files
-    inits    = attributes.fetch(:deb_init_list, [])
-    defaults = attributes.fetch(:deb_default_list, [])
-    upstarts = attributes.fetch(:deb_upstart_list, [])
-    return unless (config_files.any? or inits.any? or defaults.any? or upstarts.any?)
-
     allconfigs = []
 
     # expand recursively a given path to be put in allconfigs
@@ -752,31 +736,10 @@ class FPM::Package::Deb < FPM::Package
     rescue Errno::ENOENT
     end
 
-    if attributes[:deb_auto_config_files?]
-      inits.each do |init|
-        name = File.basename(init, ".init")
-        initscript = "/etc/init.d/#{name}"
-        logger.debug("Add conf file declaration for init script", :script => initscript)
-        allconfigs << initscript[1..-1]
-      end
-      defaults.each do |default|
-        name = File.basename(default, ".default")
-        confdefaults = "/etc/default/#{name}"
-        logger.debug("Add conf file declaration for defaults", :default => confdefaults)
-        allconfigs << confdefaults[1..-1]
-      end
-      upstarts.each do |upstart|
-        name = File.basename(upstart, ".upstart")
-        upstartscript = "etc/init/#{name}.conf"
-        logger.debug("Add conf file declaration for upstart script", :script => upstartscript)
-        allconfigs << upstartscript[1..-1]
-      end
-    end
-
     allconfigs.sort!.uniq!
     return unless allconfigs.any?
 
-    control_path("conffiles").tap do |conffiles|
+    with(control_path("conffiles")) do |conffiles|
       File.open(conffiles, "w") do |out|
         allconfigs.each do |cf|
           # We need to put the leading / back. Stops lintian relative-conffile error.
